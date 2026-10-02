@@ -1,8 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { FileSender, FileReceiver } from '../../src/transfer.js';
+import { FileSender, FileReceiver, ReceiverResume } from '../../src/transfer.js';
 import { FakePair, FakeDataChannel } from '../../src/fake-channel.js';
-import { CHUNK_SIZE, sha256, packChunk, encodeMeta, encodeEnd } from '../../src/protocol.js';
+import { CHUNK_SIZE, sha256, packChunk, encodeMeta, encodeEnd, encodeReceipt } from '../../src/protocol.js';
 
 // ---------- 辅助 ----------
 
@@ -148,7 +148,7 @@ test('背压：高水位时暂停发送，bufferedamountlow 后继续，不会�
 
 // ---------- 断开 ----------
 
-test('传输中断开通道：双方都明确失败，不会 completed', async () => {
+test('传输中断开通道：双方进入可恢复中断状态，不会 completed', async () => {
   const pair = new FakePair({
     highWaterMark: 4 * CHUNK_SIZE,
     lowThreshold: CHUNK_SIZE,
@@ -172,11 +172,11 @@ test('传输中断开通道：双方都明确失败，不会 completed', async (
   await startPromise.catch(() => {});
   await settle(10);
 
-  assert.equal(sender.state, 'failed');
+  assert.equal(sender.state, 'interrupted');
   assert.notEqual(sender.state, 'completed');
   assert.notEqual(receiver.state, 'completed');
-  assert.ok(receiver.state === 'failed' || receiver.state === 'active',
-    `接收方应明确失败或仍在传输，实际 ${receiver.state}`);
+  assert.ok(['interrupted', 'active'].includes(receiver.state),
+    `接收方应可恢复或仍在传输，实际 ${receiver.state}`);
 });
 
 test('未传输时断开不产生假完成；之后新传输仍可工作（重连语义）', async () => {
@@ -408,7 +408,9 @@ test('新 meta 丢弃旧传输半成品；旧传输迟到的 end/块不能完成
 
   const size1 = CHUNK_SIZE * 4;
   const id1 = 'old-transfer';
-  fromA(encodeMeta({ id: id1, name: 'old.bin', size: size1, chunks: 4, hash: 'oldhash' }));
+  const bytes1 = new Uint8Array(size1).fill(1);
+  const hash1 = await sha256(bytes1);
+  fromA(encodeMeta({ id: id1, name: 'old.bin', size: size1, chunks: 4, hash: hash1 }));
   pair.tick(); // 假通道由 tick 异步投递
   assert.equal(receiver.state, 'active');
   // 收到旧传输的两个块
@@ -433,7 +435,7 @@ test('新 meta 丢弃旧传输半成品；旧传输迟到的 end/块不能完成
 
   // 旧传输迟到的块与 end：必须被无视，不能完成也不能搞坏新传输
   fromA(packChunk(2, new Uint8Array(CHUNK_SIZE).fill(1)));
-  fromA(encodeEnd({ id: id1, hash: 'oldhash' }));
+  fromA(encodeEnd({ id: id1, hash: hash1 }));
   pair.tick();
   assert.equal(receiver.state, 'active');
   assert.equal(receiver.receivedBytes, 0);
@@ -492,7 +494,9 @@ test('越界序号的迟到块被忽略；范围内但大小错误的块判失�
   const pair = new FakePair({ bytesPerTick: CHUNK_SIZE });
   const receiver = new FileReceiver(pair.b);
   const id = 'x';
-  pair.a.send(encodeMeta({ id, name: 'f', size: CHUNK_SIZE, chunks: 1, hash: 'h' }));
+  const chunkBytes = new Uint8Array(CHUNK_SIZE);
+  const hash = await sha256(chunkBytes);
+  pair.a.send(encodeMeta({ id, name: 'f', size: CHUNK_SIZE, chunks: 1, hash }));
   pair.tick();
   assert.equal(receiver.state, 'active');
   // 越界块 #5：当作旧传输迟到数据忽略，不失败、不完成
@@ -512,11 +516,249 @@ test('越界序号的迟到块被忽略；范围内但大小错误的块判失�
   pair.drop();
 });
 
-test('FileSender 依赖的通道形状可替换：裸 FakeDataChannel 也能构造并取消', () => {
-  const ch = new FakeDataChannel('solo');
-  const sender = new FileSender(ch);
-  assert.equal(sender.state, 'idle');
-  sender.cancel(); // 空闲取消无副作用
-  assert.equal(sender.state, 'idle');
-  sender.destroy();
+
+// ---------- 显式恢复 ----------
+
+test('断线后显式恢复：新连接只发下一块起的数据，整文件逐字节一致', async () => {
+  const size = CHUNK_SIZE * 6 + 77;
+  const bytes = new Uint8Array(size);
+  for (let i = 0; i < size; i++) bytes[i] = (i * 13 + 5) & 0xff;
+  const file = new Blob([bytes]);
+  file.name = 'resume.bin';
+  const fullHash = await sha256(bytes);
+
+  const pair1 = new FakePair({ bytesPerTick: CHUNK_SIZE });
+  let sender1 = new FileSender(pair1.a, { perChunkDelay: 2 });
+  let receiver1 = new FileReceiver(pair1.b);
+  const start = sender1.start(file);
+  await waitForState(sender1, 'active');
+  await waitForState(receiver1, 'active');
+  for (let waited = 0; waited < 500 && receiver1.receivedBytes < 3 * CHUNK_SIZE; waited += 2) {
+    await settle(2);
+  }
+  assert.ok(receiver1.receivedBytes >= 3 * CHUNK_SIZE);
+  pair1.drop();
+  await start.catch(() => {});
+  await settle(5);
+  assert.equal(sender1.state, 'interrupted');
+  assert.equal(receiver1.state, 'interrupted');
+
+  const resumeSnapshot = await receiver1.suspendForReconnect();
+  sender1.suspendForReconnect();
+  assert.ok(resumeSnapshot.nextChunk >= 3);
+  assert.equal(resumeSnapshot.id, sender1.id);
+  assert.equal(resumeSnapshot.prefixBytes, resumeSnapshot.nextChunk * CHUNK_SIZE);
+  assert.equal(resumeSnapshot.prefixHash,
+    await sha256(bytes.slice(0, resumeSnapshot.prefixBytes)));
+
+  const pair2 = new FakePair({ bytesPerTick: CHUNK_SIZE });
+  const attemptA = 'attempt-A';
+  const attemptB = 'attempt-B';
+  let newChunkMessages = 0;
+  const originalSend = pair2.a.send.bind(pair2.a);
+  pair2.a.send = (data) => {
+    if (typeof data !== 'string') newChunkMessages += 1;
+    return originalSend(data);
+  };
+  const sender2 = new FileSender(pair2.a, {
+    attemptId: attemptA,
+    getResumeFile: () => file,
+  });
+  const receiver2 = new FileReceiver(pair2.b, {
+    attemptId: attemptB,
+    resume: resumeSnapshot,
+  });
+  assert.equal(receiver2.attemptId, attemptB);
+  assert.equal(sender2.attemptId, attemptA);
+  assert.equal(receiver2.state, 'resumable');
+  assert.equal(receiver2.nextChunk, resumeSnapshot.nextChunk);
+
+  const completed = waitForState(receiver2, 'completed');
+  receiver2.resume();
+  const result = await completed;
+  await waitForState(sender2, 'completed');
+
+  assert.equal(newChunkMessages, 7 - resumeSnapshot.nextChunk, '只发送剩余块');
+  assert.equal(result.size, size);
+  assert.equal(result.hash, fullHash);
+  const got = await readBlob(result.blob);
+  assert.ok(got.every((b, i) => b === bytes[i]), '恢复后整文件逐字节一致');
+  pair2.drop();
+});
+
+test('前缀摘要不符：发送方拒绝恢复，双方失败并清空半成品', async () => {
+  const size = CHUNK_SIZE * 3;
+  const bytes = new Uint8Array(size).fill(20);
+  const file = new Blob([bytes]);
+  file.name = 'prefix.bin';
+  const snapshot = new ReceiverResume({
+    id: 'p',
+    name: 'prefix.bin',
+    size,
+    totalChunks: 3,
+    hash: await sha256(bytes),
+    nextChunk: 1,
+    prefixHash: 'f'.repeat(64),
+    savedChunks: [new Uint8Array(CHUNK_SIZE).fill(20)],
+  });
+  const pair = new FakePair();
+  const sender = new FileSender(pair.a, { getResumeFile: () => file });
+  const receiver = new FileReceiver(pair.b, { resume: snapshot });
+  const receiverFailed = waitForState(receiver, 'failed');
+  receiver.resume();
+  const detail = await receiverFailed;
+  await waitForState(sender, 'failed');
+  assert.match(detail.reason, /前缀/);
+  assert.equal(receiver.receivedBytes, 0);
+  pair.drop();
+});
+
+test('换文件：整文件身份或长度不符时拒绝恢复且不发送任何块', async () => {
+  const original = new Uint8Array(CHUNK_SIZE * 2).fill(1);
+  const changed = new Uint8Array(original.byteLength + 1);
+  changed.set(original);
+  changed[changed.length - 1] = 2;
+  const file = new Blob([changed]);
+  file.name = 'same-name.bin';
+  const snapshot = new ReceiverResume({
+    id: 'changed',
+    name: 'same-name.bin',
+    size: original.length,
+    totalChunks: 2,
+    hash: await sha256(original),
+    nextChunk: 1,
+    prefixHash: await sha256(original.slice(0, CHUNK_SIZE)),
+    savedChunks: [original.slice(0, CHUNK_SIZE)],
+  });
+  const pair = new FakePair();
+  let binarySends = 0;
+  const raw = pair.a.send.bind(pair.a);
+  pair.a.send = (d) => {
+    if (typeof d !== 'string') binarySends += 1;
+    return raw(d);
+  };
+  const sender = new FileSender(pair.a, { getResumeFile: () => file });
+  const receiver = new FileReceiver(pair.b, { resume: snapshot });
+  receiver.resume();
+  await waitForState(receiver, 'failed');
+  await waitForState(sender, 'failed');
+  assert.equal(binarySends, 0);
+  pair.drop();
+});
+
+test('恢复后取消：双方清空不可再信任的半成品，后续迟到块/end 被隔离', async () => {
+  const size = CHUNK_SIZE * 4;
+  const bytes = new Uint8Array(size).fill(40);
+  const file = new Blob([bytes]);
+  file.name = 'cancel-resume.bin';
+  const snapshot = new ReceiverResume({
+    id: 'cr',
+    name: 'cancel-resume.bin',
+    size,
+    totalChunks: 4,
+    hash: await sha256(bytes),
+    nextChunk: 2,
+    prefixHash: await sha256(bytes.slice(0, CHUNK_SIZE * 2)),
+    savedChunks: [
+      bytes.slice(0, CHUNK_SIZE),
+      bytes.slice(CHUNK_SIZE, CHUNK_SIZE * 2),
+    ],
+  });
+  const pair = new FakePair({ bytesPerTick: CHUNK_SIZE });
+  const sender = new FileSender(pair.a, { perChunkDelay: 5, getResumeFile: () => file });
+  const receiver = new FileReceiver(pair.b, { resume: snapshot });
+  receiver.resume();
+  await waitForState(sender, 'active');
+  await settle(2);
+  receiver.cancel('恢复后仍不要了');
+  await waitForState(receiver, 'canceled');
+  await waitForState(sender, 'canceled');
+  assert.equal(receiver.receivedBytes, 0);
+
+  // 模拟取消后迟到的剩余块和 end：不能把新尝试/已取消状态变成完成。
+  pair.b._deliver({ data: packChunk(2, bytes.slice(2 * CHUNK_SIZE, 3 * CHUNK_SIZE)) });
+  pair.b._deliver({ data: encodeEnd({ id: 'cr', hash: await sha256(bytes) }) });
+  pair.a._deliver({ data: encodeReceipt({ id: 'cr', ok: true, hash: await sha256(bytes) }) });
+  await settle(5);
+  assert.equal(receiver.state, 'canceled');
+  assert.equal(sender.state, 'canceled');
+  pair.drop();
+});
+
+test('恢复前用户放弃前缀：快照被清空，随后新 meta 可正常首次传输', async () => {
+  const size = CHUNK_SIZE * 2;
+  const bytes = new Uint8Array(size).fill(31);
+  const snapshot = new ReceiverResume({
+    id: 'discard-before-resume',
+    name: 'old.bin',
+    size,
+    totalChunks: 2,
+    hash: await sha256(bytes),
+    nextChunk: 1,
+    prefixHash: await sha256(bytes.slice(0, CHUNK_SIZE)),
+    savedChunks: [bytes.slice(0, CHUNK_SIZE)],
+  });
+  const pair = new FakePair();
+  const receiver = new FileReceiver(pair.b, { resume: snapshot });
+  assert.equal(receiver.receivedBytes, CHUNK_SIZE);
+  receiver.cancel('用户放弃');
+  assert.equal(receiver.state, 'canceled');
+  assert.equal(receiver.receivedBytes, 0);
+
+  const fresh = new Uint8Array(CHUNK_SIZE + 2).fill(62);
+  const freshHash = await sha256(fresh);
+  const done = waitForState(receiver, 'completed');
+  pair.a.send(encodeMeta({
+    id: 'fresh', name: 'fresh.bin', size: fresh.length,
+    chunks: 2, hash: freshHash,
+  }));
+  pair.a.send(packChunk(0, fresh.slice(0, CHUNK_SIZE)));
+  pair.a.send(packChunk(1, fresh.slice(CHUNK_SIZE)));
+  pair.a.send(encodeEnd({ id: 'fresh', hash: freshHash }));
+  const result = await done;
+  assert.equal(result.name, 'fresh.bin');
+  pair.drop();
+});
+
+test('恢复后最终整文件 SHA-256 不符：失败回执清空接收前缀并使发送方失败', async () => {
+  const original = new Uint8Array(CHUNK_SIZE * 3).fill(50);
+  const file = new Blob([original]);
+  file.name = 'tail.bin';
+  const snapshot = new ReceiverResume({
+    id: 'hash-after-resume',
+    name: 'tail.bin',
+    size: original.length,
+    totalChunks: 3,
+    hash: await sha256(original),
+    nextChunk: 1,
+    prefixHash: await sha256(original.slice(0, CHUNK_SIZE)),
+    savedChunks: [original.slice(0, CHUNK_SIZE)],
+  });
+  const pair = new FakePair();
+  pair.setTransform((from, message) => {
+    if (from !== pair.a || message.kind !== 'binary') return message;
+    const seq = new DataView(message.data).getUint32(0, false);
+    if (seq !== 2) return message;
+    const copy = message.data.slice(0);
+    new Uint8Array(copy)[copy.byteLength - 1] ^= 0xff;
+    return { kind: 'binary', data: copy, size: copy.byteLength };
+  });
+  const sender = new FileSender(pair.a, { getResumeFile: () => file });
+  const receiver = new FileReceiver(pair.b, { resume: snapshot });
+  receiver.resume();
+  const detail = await waitForState(receiver, 'failed');
+  await waitForState(sender, 'failed');
+  assert.match(detail.reason, /SHA-256/);
+  assert.equal(receiver.receivedBytes, 0);
+  pair.drop();
+});
+
+test('损坏的本地续传身份不能被新接收对象采纳', () => {
+  assert.throws(() => new FileReceiver(new FakeDataChannel('bad-resume'), {
+    resume: new ReceiverResume({
+      id: 'bad', name: 'x', size: CHUNK_SIZE, totalChunks: 1,
+      hash: 'a'.repeat(64), nextChunk: 1, prefixHash: 'b'.repeat(64),
+      savedChunks: [],
+    }),
+  }), /连续块/);
 });

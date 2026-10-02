@@ -5,6 +5,8 @@ import { existsSync } from 'node:fs';
 const localLibDirs = [
   '/home/node/chromelibs/root/usr/lib/aarch64-linux-gnu',
   '/home/node/chromelibs/root/lib/aarch64-linux-gnu',
+  '/home/node/browserlibs/usr/lib/aarch64-linux-gnu',
+  '/home/node/browserlibs/lib/aarch64-linux-gnu',
 ].filter(existsSync);
 
 export function launchEnv() {

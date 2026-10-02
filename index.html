@@ -58,7 +58,8 @@
     .badge.idle { background: var(--panel-2); color: var(--muted); }
     .badge.connecting { background: #31415f; color: #bcd1ff; }
     .badge.connected, .badge.completed { background: rgba(53,196,141,.16); color: var(--ok); }
-    .badge.hashing, .badge.active, .badge.confirming, .badge.verifying { background: rgba(91,157,255,.16); color: var(--accent); }
+    .badge.hashing, .badge.active, .badge.confirming, .badge.verifying, .badge.resuming { background: rgba(91,157,255,.16); color: var(--accent); }
+    .badge.interrupted, .badge.resumable { background: rgba(245,165,36,.16); color: var(--warn); }
     .badge.canceled { background: rgba(245,165,36,.16); color: var(--warn); }
     .badge.failed { background: rgba(242,96,103,.16); color: var(--err); }
     .progress {
@@ -90,12 +91,13 @@
       <div class="row">
         <label class="role"><input type="radio" name="role" value="offer" checked /> 发起方（页面 A）</label>
         <label class="role"><input type="radio" name="role" value="answer" /> 应答方（页面 B）</label>
-        <button id="restart" class="secondary" type="button">重置 / 重新连接</button>
+        <button id="restart" class="secondary" type="button">重新连接（保留可恢复前缀）</button>
       </div>
       <ol class="steps">
         <li>发起方点「生成连接信息」，把文本框内容复制给应答方（聊天/U盘均可）。</li>
         <li>应答方粘贴后点「生成应答信息」，再把生成的文本复制回发起方。</li>
         <li>发起方粘贴应答并点「接受应答」，状态变为已连接后即可传文件。</li>
+        <li>若传输末尾断线，双方点「重新连接」并重复上面的交换步骤；接收方再点「恢复本次传输」，前缀核对通过后只续发剩余块。</li>
       </ol>
 
       <div class="row" style="margin-top:8px">
@@ -128,15 +130,19 @@
           <input type="file" id="file-input" />
           <button id="send-btn" type="button" disabled>发送</button>
           <button id="cancel-send" class="danger" type="button" hidden>取消发送</button>
+          <button id="discard-sender-resume" class="secondary" type="button" hidden>放弃续传，改发新文件</button>
         </div>
         <div class="hint">仅接受 ≤ 5 MiB 的单个文件。</div>
       </div>
 
       <div id="receiver-box" hidden>
         <div class="filemeta" id="recv-meta">等待文件元信息…</div>
-        <div class="row" style="margin-top:8px">
+        <div class="row" id="receiver-actions" style="margin-top:8px">
           <button id="cancel-recv" class="danger" type="button" hidden>拒收并取消</button>
+          <button id="resume-recv" class="secondary" type="button" hidden>恢复本次传输</button>
+          <button id="discard-resume" class="danger" type="button" hidden>放弃已收前缀</button>
         </div>
+        <div class="hint" id="resume-hint" hidden></div>
       </div>
 
       <div class="status" style="margin-top:10px">

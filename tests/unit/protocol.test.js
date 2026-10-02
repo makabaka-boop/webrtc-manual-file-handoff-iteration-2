@@ -6,6 +6,9 @@ import {
   packChunk,
   unpackChunk,
   encodeMeta,
+  encodeResume,
+  encodeResumeAccept,
+  encodeResumeReject,
   encodeEnd,
   encodeReceipt,
   parseControl,
@@ -41,10 +44,46 @@ test('packChunk 拒绝超过 16 KiB 的块', () => {
 
 test('meta 往返且 chunks 必须与 size/CHUNK_SIZE 自洽', () => {
   const size = CHUNK_SIZE + 1;
-  const text = encodeMeta({ id: 'x', name: 'a.bin', size, chunks: 2, hash: 'h' });
+  const hash = 'a'.repeat(64);
+  const text = encodeMeta({ id: 'x', name: 'a.bin', size, chunks: 2, hash });
   const msg = parseControl(text);
-  assert.deepEqual(msg, { kind: 'meta', id: 'x', name: 'a.bin', size, chunks: 2, hash: 'h' });
+  assert.deepEqual(msg, { kind: 'meta', id: 'x', name: 'a.bin', size, chunks: 2, hash });
 });
+
+test('resume 往返：携带原传输身份、下一块与前缀摘要', () => {
+  const hash = 'a'.repeat(64);
+  const prefixHash = 'b'.repeat(64);
+  const text = encodeResume({
+    id: 't', name: 'a.bin', size: CHUNK_SIZE * 2 + 1, chunks: 3,
+    hash, nextChunk: 2, prefixHash,
+  });
+  assert.deepEqual(parseControl(text), {
+    kind: 'resume', id: 't', name: 'a.bin', size: CHUNK_SIZE * 2 + 1, chunks: 3,
+    hash, nextChunk: 2, prefixHash,
+  });
+});
+
+test('resume 拒绝越界序号、错误文件身份和空前缀摘要', () => {
+  const good = {
+    id: 't', name: 'a', size: CHUNK_SIZE, chunks: 1,
+    hash: 'a'.repeat(64), nextChunk: 0, prefixHash: 'b'.repeat(64),
+  };
+  assert.equal(parseControl(encodeResume({ ...good, nextChunk: 2 })), null);
+  assert.equal(parseControl(encodeResume({ ...good, chunks: 2 })), null);
+  assert.equal(parseControl(encodeResume({ ...good, hash: 'bad' })), null);
+  assert.equal(parseControl(encodeResume({ ...good, prefixHash: '' })), null);
+});
+
+test('resume-accept / resume-reject 往返', () => {
+  const prefixHash = 'c'.repeat(64);
+  assert.deepEqual(parseControl(encodeResumeAccept({ id: 't', nextChunk: 3, prefixHash })), {
+    kind: 'resume-accept', id: 't', nextChunk: 3, prefixHash,
+  });
+  assert.deepEqual(parseControl(encodeResumeReject({ id: 't', reason: '前缀不符' })), {
+    kind: 'resume-reject', id: 't', reason: '前缀不符',
+  });
+});
+
 
 test('parseControl 拒绝各类畸形控制消息', () => {
   assert.equal(parseControl('not json'), null);
