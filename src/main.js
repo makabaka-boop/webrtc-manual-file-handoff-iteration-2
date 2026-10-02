@@ -1,7 +1,8 @@
 // 页面入口：手工信令 + 传输 UI 编排。
 //
 // 关键不变式：
-//  - 重连（reset）会关闭旧 PeerConnection 并解掉所有监听，旧传输对象随之失效；
+//  - “重置 / 重新连接”关闭旧 PeerConnection 和 DataChannel，但保留页面内传输状态机；
+//    新 SDP 建连后传输对象 attach 新通道，由用户显式恢复同一传输。
 //  - 只有接收方完成 大小/序号/SHA-256 全部校验后才出现下载链接；
 //  - 任何失败都显示明确原因，绝不出现“假装传输完成”。
 
@@ -32,10 +33,12 @@ const els = {
   transferPanel: $('transfer-panel'),
   fileInput: $('file-input'),
   sendBtn: $('send-btn'),
+  resumeSend: $('resume-send'),
   cancelSend: $('cancel-send'),
   senderBox: $('sender-box'),
   receiverBox: $('receiver-box'),
   recvMeta: $('recv-meta'),
+  resumeRecv: $('resume-recv'),
   cancelRecv: $('cancel-recv'),
   xferState: $('xfer-state'),
   xferDetail: $('xfer-detail'),
@@ -53,6 +56,8 @@ const STATE_LABELS = {
   hashing: '计算哈希中',
   active: '传输中',
   confirming: '等待接收校验',
+  resuming: '正在恢复',
+  interrupted: '等待恢复',
   verifying: '校验中',
   completed: '完成',
   canceled: '已取消',
@@ -140,27 +145,39 @@ function setProgress(loaded, total) {
   els.progressText.textContent = `${formatBytes(loaded)} / ${formatBytes(total)}（${pct.toFixed(1)}%）`;
 }
 
-/** 关闭并丢弃当前连接相关的一切（旧传输半成品不会影响之后的新连接）。 */
-function teardownConnection(message) {
-  clearDownload();
+function connected() {
+  return session.channel?.readyState === 'open';
+}
+
+/** 根据连接与传输状态刷新显式恢复按钮；恢复必须由用户点击，不自动重发。 */
+function updateResumeControls() {
+  const senderRecoverable = session.sender?.state === 'interrupted';
+  els.resumeSend.hidden = !senderRecoverable;
+  els.resumeSend.disabled = !connected();
+
+  const receiverRecoverable = session.receiver?.state === 'interrupted';
+  els.resumeRecv.hidden = !receiverRecoverable;
+  els.resumeRecv.disabled = !connected();
+
+  if (session.sender?.state === 'interrupted') {
+    els.sendBtn.disabled = true;
+    els.fileInput.disabled = false;
+  }
+}
+
+/** 关闭底层连接；传输状态机保留，便于重新交换 SDP 后显式恢复。 */
+function closeConnection(message) {
   if (session.stopMonitor) {
     session.stopMonitor();
     session.stopMonitor = null;
   }
-  for (const t of [session.sender, session.receiver]) {
-    try {
-      t?.fail?.(message || '连接已重置');
-    } catch {
-      // ignore
-    }
-    try {
-      t?.destroy?.();
-    } catch {
-      // ignore
+  if (session.sender || session.receiver) {
+    for (const t of [session.sender, session.receiver]) {
+      // 监听从旧通道解绑；传输对象等待 attach 新通道。若当前仍在传输，
+      // channel.close 触发的状态机会进入 interrupted，而不是销毁可恢复前缀。
+      try { t?.detach?.(); } catch { /* ignore */ }
     }
   }
-  session.sender = null;
-  session.receiver = null;
   try {
     session.channel?.close?.();
   } catch {
@@ -173,7 +190,21 @@ function teardownConnection(message) {
   }
   session.channel = null;
   session.pc = null;
-  els.transferPanel.hidden = true;
+  // 关闭前解绑传输监听，避免 close 事件顺序差异；这里统一把可恢复传输置为等待恢复。
+  try { session.sender?._interrupt?.(message || 'DataChannel 已关闭，等待显式恢复'); } catch { /* ignore */ }
+  try { session.receiver?._interrupt?.(message || 'DataChannel 已关闭，等待显式恢复'); } catch { /* ignore */ }
+  els.transferPanel.hidden = !(session.sender || session.receiver);
+}
+
+/** 彻底丢弃传输半成品（切换角色、测试重置或用户明确放弃时）。 */
+function destroyTransfer(message = '连接已重置') {
+  clearDownload();
+  for (const t of [session.sender, session.receiver]) {
+    try { t?.fail?.(message); } catch { /* ignore */ }
+    try { t?.destroy?.(); } catch { /* ignore */ }
+  }
+  session.sender = null;
+  session.receiver = null;
 }
 
 function resetView() {
@@ -192,13 +223,35 @@ function resetView() {
   setProgress(0, 0);
   els.fileInput.value = '';
   els.sendBtn.disabled = true;
+  els.resumeSend.hidden = true;
   els.cancelSend.hidden = true;
+  els.resumeRecv.hidden = true;
   els.cancelRecv.hidden = true;
   els.recvMeta.textContent = '等待文件元信息…';
 }
 
+function reconnectConnection() {
+  closeConnection();
+  clearConnError();
+  setConnBadge('idle', '未连接');
+  els.connDetail.textContent = '';
+  els.signalIn.value = '';
+  els.signalOut.value = '';
+  els.signalIn.hidden = false;
+  els.signalInLabel.hidden = false;
+  els.signalOut.hidden = true;
+  els.signalOutLabel.hidden = true;
+  els.copyRow.hidden = true;
+  els.offerBtn.disabled = false;
+  els.answerBtn.disabled = false;
+  els.acceptBtn.disabled = false;
+  applyRoleView();
+  updateResumeControls();
+}
+
 function resetAll(message) {
-  teardownConnection(message);
+  closeConnection();
+  destroyTransfer(message);
   resetView();
   applyRoleView();
 }
@@ -228,15 +281,29 @@ function wireTransferObjects() {
     const { state, reason } = e.detail;
     setXferBadge(state, state === 'failed' && reason ? reason : '');
     clearTransferFeedback();
-    if (state === 'active' || state === 'confirming') {
+    if (state === 'active' || state === 'confirming' || state === 'resuming') {
       els.cancelSend.hidden = false;
+      els.resumeSend.hidden = true;
       els.sendBtn.disabled = true;
       els.fileInput.disabled = true;
     }
     if (state === 'hashing') {
       els.sendBtn.disabled = true;
+      els.fileInput.disabled = true;
+    }
+    if (state === 'interrupted') {
+      els.cancelSend.hidden = false;
+      els.fileInput.disabled = false;
+      els.sendBtn.disabled = true;
+      els.resumeSend.hidden = false;
+      els.resumeSend.disabled = !connected();
+      showXferWarn('连接已断开：已保留所选文件身份；重新连接后点“恢复本次传输”，不会重发已收块。');
+    }
+    if (state === 'resuming') {
+      showXferWarn(`正在从块 #${e.detail.nextChunk ?? 0} 核对并续传…`);
     }
     if (state === 'completed') {
+      els.resumeSend.hidden = true;
       els.cancelSend.hidden = true;
       els.fileInput.disabled = false;
       els.fileInput.value = '';
@@ -244,12 +311,14 @@ function wireTransferObjects() {
       setProgress(sender.file?.size ?? 0, sender.file?.size ?? 0);
     }
     if (state === 'failed') {
+      els.resumeSend.hidden = true;
       els.cancelSend.hidden = true;
       els.fileInput.disabled = false;
       els.sendBtn.disabled = false;
       if (reason) showXferError(reason);
     }
     if (state === 'canceled') {
+      els.resumeSend.hidden = true;
       els.cancelSend.hidden = true;
       els.fileInput.disabled = false;
       els.sendBtn.disabled = false;
@@ -267,19 +336,37 @@ function wireTransferObjects() {
     setXferBadge(state, state === 'failed' && reason ? reason : '');
     if (state === 'active') {
       els.receiverBox.hidden = false;
+      els.resumeRecv.hidden = true;
+      els.cancelRecv.hidden = false;
       els.recvMeta.innerHTML =
         `接收文件：<code></code>`;
       els.recvMeta.querySelector('code').textContent = name;
       els.recvMeta.append(` · ${formatBytes(size)}`);
-      setProgress(0, size);
+      if (Number.isInteger(e.detail.nextChunk) && e.detail.nextChunk > 0) {
+        els.recvMeta.append(` · 从块 #${e.detail.nextChunk} 续传`);
+        setProgress(session.receiver.receivedBytes, size);
+      } else {
+        setProgress(0, size);
+      }
       clearDownload();
+    }
+    if (state === 'resuming') {
+      els.resumeRecv.hidden = true;
       els.cancelRecv.hidden = false;
+      showXferWarn(`正在声明恢复：从块 #${e.detail.nextChunk ?? 0} 继续，前缀摘要已发送给发送方核对。`);
+    }
+    if (state === 'interrupted') {
+      els.cancelRecv.hidden = false;
+      els.resumeRecv.hidden = false;
+      els.resumeRecv.disabled = !connected();
+      showXferWarn(`连接已断开：当前页面仅暂存到块 #${e.detail.nextChunk ?? session.receiver?.nextChunk ?? 0} 的连续前缀；重新连接后显式恢复。`);
     }
     if (state === 'verifying') {
       setProgress(session.receiver.receivedBytes, session.receiver._meta?.size ?? 0);
     }
     if (state === 'completed') {
       setProgress(size, size);
+      els.resumeRecv.hidden = true;
       els.cancelRecv.hidden = true;
       // 仅在大小、序号、哈希全部校验通过后才产生下载链接。
       session.downloadUrl = URL.createObjectURL(blob);
@@ -296,12 +383,14 @@ function wireTransferObjects() {
     if (state === 'failed') {
       setProgress(0, 0);
       clearDownload();
+      els.resumeRecv.hidden = true;
       els.cancelRecv.hidden = true;
       if (reason) showXferError(reason);
     }
     if (state === 'canceled') {
       setProgress(0, 0);
       clearDownload();
+      els.resumeRecv.hidden = true;
       els.cancelRecv.hidden = true;
       showXferWarn('传输已取消，已丢弃已收到的半成品块。');
     }
@@ -320,22 +409,27 @@ function attachChannel(channel) {
     els.connDetail.textContent = '';
     els.transferPanel.hidden = false;
 
-    // 同一通道上同时具备收发能力；每次连接只创建一次传输对象，
-    // 新传输的 meta 会自动丢弃旧传输的半成品。
+    // 同一传输对象可换接新 DataChannel；attach 会解绑旧通道并推进尝试代际。
+    // 首次连接才创建传输对象；断线保留在页面内存中的前缀与传输身份。
     if (!session.sender) {
       const perChunkDelay = Number(new URLSearchParams(location.search).get('chunkDelay')) || 0;
       session.sender = new FileSender(channel, { perChunkDelay });
       session.receiver = new FileReceiver(channel);
       wireTransferObjects();
+    } else {
+      session.sender.attach(channel);
+      session.receiver.attach(channel);
     }
     els.senderBox.hidden = false;
     els.sendBtn.disabled = !els.fileInput.files[0];
+    updateResumeControls();
   };
 
   channel.addEventListener('open', openIfReady);
   openIfReady(); // 可能已经 open
   channel.addEventListener('close', () => {
     setConnBadge('idle', '通道已关闭');
+    updateResumeControls();
   });
 }
 
@@ -349,7 +443,7 @@ async function onOffer() {
       onFailed: (err) => {
         setConnBadge('failed', '');
         showConnError(err.message);
-        teardownConnection(err.message);
+        closeConnection(err.message);
       },
       onClosed: () => {
         setConnBadge('idle', '连接已关闭');
@@ -389,7 +483,7 @@ async function onAnswer() {
       onFailed: (err) => {
         setConnBadge('failed', '');
         showConnError(err.message);
-        teardownConnection(err.message);
+        closeConnection(err.message);
       },
       onClosed: () => {
         setConnBadge('idle', '连接已关闭');
@@ -463,6 +557,35 @@ async function onSend() {
   }
 }
 
+async function onResumeSend() {
+  const file = els.fileInput.files[0];
+  clearTransferFeedback();
+  if (!file) {
+    showXferError('请重新选择同一文件后再恢复；发送方必须核对文件身份和前缀字节。');
+    return;
+  }
+  els.resumeSend.disabled = true;
+  try {
+    await session.sender.resume(file);
+  } catch {
+    // resume 自身已进入 failed 并显示原因；接收方也会收到 false resume-ack/cancel。
+  } finally {
+    updateResumeControls();
+  }
+}
+
+async function onResumeReceive() {
+  clearTransferFeedback();
+  els.resumeRecv.disabled = true;
+  try {
+    await session.receiver.resume();
+  } catch {
+    // resume 已进入 failed 并显示原因。
+  } finally {
+    updateResumeControls();
+  }
+}
+
 async function copyOut() {
   try {
     await navigator.clipboard.writeText(els.signalOut.value);
@@ -477,9 +600,7 @@ async function copyOut() {
 // ---- 事件绑定 ----
 els.role.forEach((r) => r.addEventListener('change', () => resetAll('切换角色')));
 els.restart.addEventListener('click', () => {
-  resetAll('手动重置');
-  els.offerBtn.disabled = false;
-  els.answerBtn.disabled = false;
+  reconnectConnection();
 });
 els.offerBtn.addEventListener('click', onOffer);
 els.answerBtn.addEventListener('click', onAnswer);
@@ -494,6 +615,8 @@ els.fileInput.addEventListener('change', () => {
   }
 });
 els.sendBtn.addEventListener('click', onSend);
+els.resumeSend.addEventListener('click', onResumeSend);
+els.resumeRecv.addEventListener('click', onResumeReceive);
 els.cancelSend.addEventListener('click', () => session.sender.cancel());
 els.cancelRecv.addEventListener('click', () => session.receiver?.cancel('接收方拒收'));
 
@@ -503,5 +626,15 @@ applyRoleView();
 window.__app = {
   session,
   MAX_FILE_SIZE,
-  reset: () => resetAll('测试重置'),
+  reconnect: () => reconnectConnection(),
+  destroyTransfer: (message = '测试放弃') => {
+    destroyTransfer(message);
+    resetView();
+    applyRoleView();
+  },
+  disconnectDataChannel: () => {
+    session.channel?.close?.();
+  },
+  resumeSender: () => onResumeSend(),
+  resumeReceiver: () => onResumeReceive(),
 };

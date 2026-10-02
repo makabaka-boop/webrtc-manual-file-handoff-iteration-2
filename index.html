@@ -59,8 +59,9 @@
     .badge.connecting { background: #31415f; color: #bcd1ff; }
     .badge.connected, .badge.completed { background: rgba(53,196,141,.16); color: var(--ok); }
     .badge.hashing, .badge.active, .badge.confirming, .badge.verifying { background: rgba(91,157,255,.16); color: var(--accent); }
-    .badge.canceled { background: rgba(245,165,36,.16); color: var(--warn); }
+    .badge.canceled, .badge.interrupted { background: rgba(245,165,36,.16); color: var(--warn); }
     .badge.failed { background: rgba(242,96,103,.16); color: var(--err); }
+    .badge.resuming { background: rgba(91,157,255,.16); color: var(--accent); }
     .progress {
       height: 8px; background: var(--panel-2); border-radius: 999px; overflow: hidden;
       margin: 10px 0 4px;
@@ -127,14 +128,16 @@
         <div class="row">
           <input type="file" id="file-input" />
           <button id="send-btn" type="button" disabled>发送</button>
+          <button id="resume-send" class="secondary" type="button" hidden>恢复本次传输</button>
           <button id="cancel-send" class="danger" type="button" hidden>取消发送</button>
         </div>
-        <div class="hint">仅接受 ≤ 5 MiB 的单个文件。</div>
+        <div class="hint">仅接受 ≤ 5 MiB 的单个文件。断线重连后请保持选择同一文件，再显式点“恢复本次传输”。</div>
       </div>
 
       <div id="receiver-box" hidden>
         <div class="filemeta" id="recv-meta">等待文件元信息…</div>
         <div class="row" style="margin-top:8px">
+          <button id="resume-recv" class="secondary" type="button" hidden>恢复本次传输</button>
           <button id="cancel-recv" class="danger" type="button" hidden>拒收并取消</button>
         </div>
       </div>
